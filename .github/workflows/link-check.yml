@@ -1,0 +1,21 @@
+name: Check download links
+
+# Once a month, make sure the FFmpeg download the installer points to still exists.
+on:
+  schedule:
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+
+jobs:
+  ffmpeg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the FFmpeg bundle
+        run: |
+          B=$(tr -d '[:space:]' < packaging/ffmpeg-bundle.txt)
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/ffmpeg-${B}"
+          for f in SHA256SUMS ffmpeg-windows-amd64.zip ffmpeg-linux-amd64.zip ffmpeg-linux-arm64.zip; do
+            if curl -fsIL "$BASE/$f" > /dev/null; then echo "ok   $f"; else echo "::error::Missing $BASE/$f"; FAIL=1; fi
+          done
+          exit ${FAIL:-0}

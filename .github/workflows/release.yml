@@ -1,0 +1,200 @@
+name: Release
+
+# Push a tag such as v1.2.0 to build everything and publish a GitHub Release.
+# "Run workflow" builds the same files without publishing (a dry run).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      bundle: ${{ steps.v.outputs.bundle }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="0.0.0-dev.${GITHUB_RUN_NUMBER}"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "bundle=$(tr -d '[:space:]' < packaging/ffmpeg-bundle.txt)" >> "$GITHUB_OUTPUT"
+          if [[ "$V" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+  ui:
+    name: Build the UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-out
+          path: ui/out
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
+    needs: [meta, ui]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      BUNDLE: ${{ needs.meta.outputs.bundle }}
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-out
+          path: ui/out
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Windows icon and version info
+        if: matrix.goos == 'windows'
+        run: |
+          GOOS= GOARCH= go install github.com/tc-hib/go-winres@latest
+          FV="${VERSION%%-*}"; while [ "$(echo "$FV" | tr -cd . | wc -c)" -lt 3 ]; do FV="$FV.0"; done
+          "$(go env GOPATH)/bin/go-winres" make --in packaging/windows/winres.json --arch amd64 --file-version "$FV" --product-version "$FV"
+
+      - name: Build
+        run: |
+          PKG=local-cinema/internal/version
+          LD="-s -w -X $PKG.Version=$VERSION -X $PKG.Commit=$GITHUB_SHA -X $PKG.Repo=$GITHUB_REPOSITORY -X $PKG.FFmpegBundle=$BUNDLE"
+          mkdir -p out dist
+          EXT=""; [ "$GOOS" = windows ] && EXT=".exe"
+          go build -trimpath -ldflags "$LD" -o "out/local-cinema$EXT" .
+          if [ "$GOOS" = windows ]; then
+            # The installed program has no console window.
+            go build -trimpath -ldflags "$LD -H=windowsgui" -o dist/local-cinema-gui.exe .
+          fi
+
+      - name: Package
+        run: |
+          NAME="local-cinema_${VERSION}_${GOOS}_${GOARCH}"
+          cp LICENSE.md THIRD_PARTY_NOTICES.md README.md out/
+          if [ "$GOOS" = windows ] || [ "$GOOS" = darwin ]; then
+            (cd out && zip -q -9 "../dist/$NAME.zip" *)
+          else
+            tar -C out -czf "dist/$NAME.tar.gz" .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 7
+
+  installer:
+    name: Windows installer
+    needs: [meta, build]
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      BUNDLE: ${{ needs.meta.outputs.bundle }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-windows-amd64
+          path: dist
+
+      - name: Find the FFmpeg download checksum
+        shell: bash
+        run: |
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/ffmpeg-${BUNDLE}/SHA256SUMS"
+          if ! curl -fsSL "$URL" -o SHA256SUMS; then
+            echo "::error::No FFmpeg bundle found at $URL. Run the 'FFmpeg bundle' workflow first (bundle name: $BUNDLE)."
+            exit 1
+          fi
+          SHA=$(grep "ffmpeg-windows-amd64.zip" SHA256SUMS | awk '{print $1}')
+          [ -n "$SHA" ] || { echo "::error::SHA256SUMS has no Windows entry."; exit 1; }
+          echo "FFMPEG_SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$env:VERSION" "/DRepo=$env:GITHUB_REPOSITORY" `
+            "/DFfmpegBundle=$env:BUNDLE" "/DFfmpegSha256=$env:FFMPEG_SHA" `
+            packaging\windows\LocalCinema.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: dist/installer/*.exe
+          retention-days: 7
+
+  release:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [meta, build, installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect files and checksums
+        run: |
+          mkdir release
+          cp artifacts/*.zip artifacts/*.tar.gz artifacts/*.exe release/ 2>/dev/null || true
+          rm -f release/local-cinema-gui.exe   # only used inside the installer
+          (cd release && sha256sum * > checksums.txt)
+
+      - name: Release notes from the changelog
+        run: |
+          awk -v h="## $VERSION" '$0 == h {on=1; next} /^## / {if (on) exit} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md for what changed." > notes.md
+          cat >> notes.md <<EOF
+
+          ## Downloads
+          - **Windows:** \`LocalCinema-Setup-${VERSION}.exe\` installs everything and downloads the video tools (FFmpeg) during setup. A portable zip is also attached.
+          - **Linux and macOS:** the archive for your system. Run \`./local-cinema\`, then open Settings to install FFmpeg (Linux) or run \`brew install ffmpeg\` (macOS).
+          - \`checksums.txt\` lists SHA-256 sums for every file.
+          EOF
+
+      - name: Publish
+        run: |
+          PRE=""; [[ "$VERSION" == *-* ]] && PRE="--prerelease"
+          gh release create "$GITHUB_REF_NAME" release/* --title "Local Cinema $VERSION" --notes-file notes.md $PRE

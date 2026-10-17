@@ -1,0 +1,10 @@
+local-cinema
+local-cinema.exe
+pb_data/
+ui/node_modules/
+ui/.next/
+ui/out/*
+!ui/out/index.html
+dist/
+rsrc_*.syso
+CHANGELOG.md

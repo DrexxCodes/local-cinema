@@ -1,0 +1,85 @@
+name: FFmpeg bundle
+
+# Publishes the FFmpeg download that the installer and the Settings page use.
+# Run this once, then put the same name in packaging/ffmpeg-bundle.txt.
+on:
+  workflow_dispatch:
+    inputs:
+      bundle:
+        description: "Bundle name, for example 2026.10 (creates the release ffmpeg-2026.10)"
+        required: true
+      windows_url:
+        description: "Windows 64-bit GPL build (zip)"
+        default: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+      linux64_url:
+        description: "Linux 64-bit GPL build (tar.xz)"
+        default: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+      linuxarm64_url:
+        description: "Linux ARM64 GPL build (tar.xz)"
+        default: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUNDLE: ${{ inputs.bundle }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build one zip per platform
+        run: |
+          set -euo pipefail
+          mkdir -p work out
+          DATE=$(date -u +%F)
+
+          pack() {  # <platform> <url> <binary suffix>
+            local plat="$1" url="$2" ext="$3" dir="work/$1"
+            mkdir -p "$dir/src" "$dir/stage"
+            curl -fsSL "$url" -o "$dir/archive"
+            local sum; sum=$(sha256sum "$dir/archive" | cut -d' ' -f1)
+            case "$url" in
+              *.zip)    unzip -q "$dir/archive" -d "$dir/src" ;;
+              *.tar.xz) tar -xJf "$dir/archive" -C "$dir/src" ;;
+            esac
+            local bin; bin=$(find "$dir/src" -type d -name bin | head -1)
+            cp "$bin/ffmpeg$ext" "$bin/ffprobe$ext" "$dir/stage/"
+            local lic; lic=$(find "$dir/src" -maxdepth 2 -iname 'LICENSE*' | head -1)
+            [ -n "$lic" ] && cp "$lic" "$dir/stage/LICENSE.txt"
+            cat > "$dir/stage/SOURCE.txt" <<TXT
+          FFmpeg ($plat) packaged for Local Cinema.
+
+          These are unmodified FFmpeg binaries (GPL build, includes x264) taken from:
+            $url
+          Archive SHA-256: $sum
+          Fetched on: $DATE
+
+          FFmpeg is free software licensed under the GNU GPL. Source code and the licence:
+            https://ffmpeg.org/download.html
+          Build scripts used for these binaries:
+            https://github.com/BtbN/FFmpeg-Builds
+
+          Local Cinema runs FFmpeg as a separate program. It is not part of Local Cinema itself.
+          TXT
+            (cd "$dir/stage" && zip -q -9 "$GITHUB_WORKSPACE/out/ffmpeg-$plat.zip" *)
+          }
+
+          pack windows-amd64 "${{ inputs.windows_url }}" .exe
+          pack linux-amd64   "${{ inputs.linux64_url }}" ""
+          pack linux-arm64   "${{ inputs.linuxarm64_url }}" ""
+          (cd out && sha256sum ffmpeg-*.zip > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      - name: Publish the release
+        run: |
+          cat > notes.md <<EOF
+          FFmpeg downloads used by the Local Cinema installer and by Settings, Install FFmpeg.
+
+          These are unmodified GPL builds of FFmpeg from BtbN/FFmpeg-Builds. FFmpeg is licensed under the GNU GPL and runs as a separate program. See SOURCE.txt inside each zip for the exact download, checksum, source code and licence links.
+
+          Do not delete this release: installers of older Local Cinema versions download from it.
+          EOF
+          gh release create "ffmpeg-$BUNDLE" out/* --title "FFmpeg bundle $BUNDLE" --notes-file notes.md
