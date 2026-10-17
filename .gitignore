@@ -7,4 +7,3 @@ ui/out/*
 !ui/out/index.html
 dist/
 rsrc_*.syso
-CHANGELOG.md
